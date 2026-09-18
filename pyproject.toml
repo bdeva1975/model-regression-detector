@@ -1,6 +1,6 @@
 [project]
 name = "model-regression-detector"
-version = "0.1.0"
+version = "0.2.0"
 description = "Detect and explain ML model regression: metric degradation, drift, segment analysis, and statistical validation - with synthetic scenarios and a Streamlit dashboard."
 readme = "README.md"
 license = { text = "MIT" }

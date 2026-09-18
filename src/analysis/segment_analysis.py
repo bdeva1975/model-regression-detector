@@ -1,4 +1,4 @@
-"""Segment-level performance comparison.
+"""Segment-level performance comparison, for both task types.
 
 Compares baseline vs candidate performance within each level of each
 segment column (region, customer_type, risk_band) to catch degradation that
@@ -7,8 +7,16 @@ overall metrics hide.
 Method
 ------
 For each segment level with at least ``config.min_segment_size`` rows in
-BOTH windows, compute accuracy, recall, precision and F1 per side, then
-bootstrap the accuracy difference within the segment for a p-value.
+BOTH windows:
+
+* classification: accuracy, precision, recall and F1 per side; the tested
+  statistic is ACCURACY (per-row correctness, mean-of-losses bootstrap);
+* regression: MAE, RMSE and bias (mean error) per side; the tested
+  statistic is MAE (per-row absolute error, mean-of-losses bootstrap).
+
+The bootstrap operates on per-row loss values (correctness / absolute
+error), so one procedure serves both tasks. Degradation direction follows
+the statistic's orientation: accuracy degrades downward, MAE upward.
 
 Multiple comparisons: with ~9 segment levels tested, a raw alpha of 0.05
 would produce false alarms; p-values are Bonferroni-adjusted across the
@@ -24,6 +32,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from src.data.synthetic_generator import TaskType
+from src.evaluation.metrics import infer_task
 from src.models.model_factory import Y_PRED, Y_TRUE
 from src.utils.config import DetectionConfig
 
@@ -34,9 +44,10 @@ class SegmentResult:
     level: str
     n_baseline: int
     n_candidate: int
-    baseline: dict[str, float]      # accuracy, precision, recall, f1
+    baseline: dict[str, float]
     candidate: dict[str, float]
-    accuracy_diff: float            # candidate - baseline
+    tested_metric: str              # "accuracy" | "mae"
+    metric_diff: float              # candidate - baseline, raw
     p_value_adjusted: float
     degraded: bool                  # practically AND statistically degraded
     skipped: bool
@@ -50,7 +61,7 @@ class SegmentReport:
     any_segment_regression: bool
 
 
-def _threshold_metrics(df: pd.DataFrame) -> dict[str, float]:
+def _classification_metrics(df: pd.DataFrame) -> dict[str, float]:
     y, p = df[Y_TRUE].to_numpy(), df[Y_PRED].to_numpy()
     tp = int(((y == 1) & (p == 1)).sum())
     fp = int(((y == 0) & (p == 1)).sum())
@@ -66,17 +77,42 @@ def _threshold_metrics(df: pd.DataFrame) -> dict[str, float]:
     }
 
 
-def _bootstrap_accuracy_p(
-    base: pd.DataFrame, cand: pd.DataFrame, config: DetectionConfig, seed: int
+def _regression_metrics(df: pd.DataFrame) -> dict[str, float]:
+    y = df[Y_TRUE].to_numpy(dtype=float)
+    p = df[Y_PRED].to_numpy(dtype=float)
+    err = p - y
+    return {
+        "mae": float(np.mean(np.abs(err))),
+        "rmse": float(np.sqrt(np.mean(err**2))),
+        "bias": float(np.mean(err)),
+    }
+
+
+def _row_losses(df: pd.DataFrame, task: TaskType) -> np.ndarray:
+    """Per-row statistic whose mean is the tested segment metric."""
+    y = df[Y_TRUE].to_numpy(dtype=float)
+    p = df[Y_PRED].to_numpy(dtype=float)
+    if task is TaskType.CLASSIFICATION:
+        return (y == p).astype(float)      # mean = accuracy
+    return np.abs(p - y)                    # mean = MAE
+
+
+def _bootstrap_mean_diff_p(
+    base_vals: np.ndarray,
+    cand_vals: np.ndarray,
+    config: DetectionConfig,
+    seed: int,
 ) -> float:
+    """Two-sample bootstrap p-value for mean(cand) - mean(base)."""
     rng = np.random.default_rng(seed)
-    by = (base[Y_TRUE].to_numpy() == base[Y_PRED].to_numpy()).astype(float)
-    cy = (cand[Y_TRUE].to_numpy() == cand[Y_PRED].to_numpy()).astype(float)
-    nb, nc = len(by), len(cy)
+    nb, nc = len(base_vals), len(cand_vals)
     iters = config.bootstrap_iterations
     diffs = np.empty(iters)
     for i in range(iters):
-        diffs[i] = cy[rng.integers(0, nc, nc)].mean() - by[rng.integers(0, nb, nb)].mean()
+        diffs[i] = (
+            cand_vals[rng.integers(0, nc, nc)].mean()
+            - base_vals[rng.integers(0, nb, nb)].mean()
+        )
     p = 2.0 * min(float(np.mean(diffs <= 0)), float(np.mean(diffs >= 0)))
     return float(np.clip(p, 1.0 / iters, 1.0))
 
@@ -85,8 +121,16 @@ def analyze_segments(
     baseline_scores: pd.DataFrame,
     candidate_scores: pd.DataFrame,
     config: DetectionConfig,
+    task: TaskType | None = None,
 ) -> SegmentReport:
     """Per-segment baseline vs candidate comparison with adjusted p-values."""
+    if task is None:
+        task = infer_task(baseline_scores)
+    is_classification = task is TaskType.CLASSIFICATION
+    metrics_fn = _classification_metrics if is_classification else _regression_metrics
+    tested_metric = "accuracy" if is_classification else "mae"
+    higher_is_better = is_classification   # accuracy up-good; MAE down-good
+
     raw: list[tuple[str, str, pd.DataFrame, pd.DataFrame]] = []
     skipped: list[SegmentResult] = []
 
@@ -103,7 +147,8 @@ def analyze_segments(
                         column=col, level=str(level),
                         n_baseline=len(b), n_candidate=len(c),
                         baseline={}, candidate={},
-                        accuracy_diff=float("nan"),
+                        tested_metric=tested_metric,
+                        metric_diff=float("nan"),
                         p_value_adjusted=float("nan"),
                         degraded=False, skipped=True,
                         skip_reason=(
@@ -118,16 +163,24 @@ def analyze_segments(
     n_tests = max(len(raw), 1)
     results: list[SegmentResult] = []
     for i, (col, level, b, c) in enumerate(raw):
-        mb, mc = _threshold_metrics(b), _threshold_metrics(c)
-        diff = mc["accuracy"] - mb["accuracy"]
+        mb, mc = metrics_fn(b), metrics_fn(c)
+        diff = mc[tested_metric] - mb[tested_metric]
+        degradation = -diff if higher_is_better else diff   # positive = worse
         p_adj = min(
             1.0,
-            n_tests * _bootstrap_accuracy_p(b, c, config, seed=config.random_seed + i),
+            n_tests
+            * _bootstrap_mean_diff_p(
+                _row_losses(b, task), _row_losses(c, task),
+                config, seed=config.random_seed + i,
+            ),
         )
-        rel = abs(diff) / mb["accuracy"] if mb["accuracy"] > 0 else float("inf")
+        base_ref = abs(mb[tested_metric])
+        rel = degradation / base_ref if base_ref > 0 else (
+            float("inf") if degradation > 0 else 0.0
+        )
         practically = (
-            diff < 0
-            and abs(diff) >= config.min_absolute_degradation
+            degradation > 0
+            and degradation >= config.min_absolute_degradation
             and rel >= config.min_relative_degradation
         )
         results.append(
@@ -135,7 +188,8 @@ def analyze_segments(
                 column=col, level=level,
                 n_baseline=len(b), n_candidate=len(c),
                 baseline=mb, candidate=mc,
-                accuracy_diff=float(diff),
+                tested_metric=tested_metric,
+                metric_diff=float(diff),
                 p_value_adjusted=p_adj,
                 degraded=bool(practically and p_adj < config.significance_level),
                 skipped=False, skip_reason="",

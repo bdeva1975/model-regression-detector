@@ -1,12 +1,13 @@
 """The regression decision engine.
 
 Combines per-metric comparison, bootstrap significance, drift analysis and
-segment analysis into a single structured ``RegressionAssessment``.
+segment analysis into a single structured ``RegressionAssessment``, for
+both task types (binary classification and continuous regression).
 
 Decision rule (per metric)
 --------------------------
 A metric counts as REGRESSED only if ALL hold, in its own orientation
-(log loss degrades upward, everything else downward):
+(log loss, MAE and RMSE degrade upward, everything else downward):
 
 1. degradation >= config.min_absolute_degradation (absolute), AND
 2. degradation >= config.min_relative_degradation (relative to baseline), AND
@@ -23,6 +24,12 @@ REGRESSION if any metric regressed OR any segment degraded. Severity is
 graded on the worst relative metric degradation (config.severity_*); a
 segment-only regression is at least MODERATE. Drift never triggers a
 regression verdict by itself - it is reported as supporting context.
+
+Note on absolute thresholds across tasks: classification metrics live on
+[0, 1], where min_absolute_degradation=0.01 means "one point". Regression
+error metrics live on the target's scale, so the relative threshold does
+the real gating there; the absolute threshold merely suppresses noise near
+zero. This asymmetry is documented rather than hidden.
 """
 
 from __future__ import annotations
@@ -34,10 +41,7 @@ from src.analysis.segment_analysis import SegmentReport, analyze_segments
 from src.data.synthetic_generator import ScenarioBundle
 from src.detection.drift_detector import DriftReport, detect_drift
 from src.detection.statistical_tests import BootstrapResult, bootstrap_metric_diff
-from src.evaluation.metrics import (
-    CLASSIFICATION_METRICS,
-    METRIC_ORIENTATION,
-)
+from src.evaluation.metrics import METRIC_ORIENTATION, METRICS_BY_TASK
 from src.models.model_factory import TrainedPair
 from src.utils.config import DetectionConfig
 
@@ -174,9 +178,10 @@ def assess(
     config: DetectionConfig,
 ) -> RegressionAssessment:
     """Run the full comparison pipeline and return one structured verdict."""
+    metric_names = METRICS_BY_TASK[bundle.task]
     boots = [
         bootstrap_metric_diff(pair.baseline_scores, pair.candidate_scores, m, config)
-        for m in CLASSIFICATION_METRICS
+        for m in metric_names
     ]
     metrics = tuple(_assess_metric(b, config) for b in boots)
     regressed = [m for m in metrics if m.status is MetricStatus.REGRESSED]
@@ -190,7 +195,9 @@ def assess(
         pair.candidate_scores,
         config,
     )
-    segments = analyze_segments(pair.baseline_scores, pair.candidate_scores, config)
+    segments = analyze_segments(
+        pair.baseline_scores, pair.candidate_scores, config, task=bundle.task
+    )
 
     detected = bool(regressed) or segments.any_segment_regression
     largest = max(regressed, key=lambda m: m.degradation_rel).metric if regressed else None

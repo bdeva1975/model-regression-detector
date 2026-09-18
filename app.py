@@ -13,24 +13,25 @@ import streamlit as st
 
 from src.analysis.explanation import explain
 from src.data.synthetic_generator import (
+    CLASSIFICATION_ONLY,
     GeneratorConfig,
     Scenario,
     ScenarioBundle,
+    TaskType,
     generate,
 )
 from src.detection.regression_detector import (
     RegressionAssessment,
-    Severity,
     assess,
 )
-from src.models.model_factory import MODEL_TYPES, TrainedPair, train_pair
+from src.models.model_factory import MODEL_TYPES, Y_PROB, TrainedPair, train_pair
 from src.utils.config import DetectionConfig
 
 st.set_page_config(page_title="Model Regression Detector", page_icon="📉", layout="wide")
 
 SCENARIO_LABELS: dict[Scenario, str] = {
     Scenario.HEALTHY: "Healthy deployment",
-    Scenario.ACCURACY_REGRESSION: "Accuracy regression",
+    Scenario.ACCURACY_REGRESSION: "Overall performance regression",
     Scenario.PRECISION_REGRESSION: "Precision regression",
     Scenario.RECALL_REGRESSION: "Recall regression",
     Scenario.SEGMENT_REGRESSION: "Segment regression",
@@ -40,16 +41,10 @@ SCENARIO_LABELS: dict[Scenario, str] = {
     Scenario.STAT_SIG_SMALL: "Statistically significant, practically small (slow)",
 }
 
-SEVERITY_COLOR = {
-    Severity.NONE: "green",
-    Severity.MODERATE: "orange",
-    Severity.HIGH: "red",
-    Severity.CRITICAL: "red",
-}
-
 
 @st.cache_resource(show_spinner=False)
 def run_pipeline(
+    task_value: str,
     scenario_value: str,
     model_type: str,
     seed: int,
@@ -63,7 +58,11 @@ def run_pipeline(
         min_relative_degradation=min_rel,
         significance_level=alpha,
     )
-    bundle = generate(GeneratorConfig(scenario=Scenario(scenario_value), seed=seed))
+    bundle = generate(
+        GeneratorConfig(
+            task=TaskType(task_value), scenario=Scenario(scenario_value), seed=seed
+        )
+    )
     pair = train_pair(bundle, model_type=model_type)
     assessment = assess(bundle, pair, config)
     return bundle, pair, assessment, config
@@ -71,12 +70,17 @@ def run_pipeline(
 
 # ---------------------------------------------------------------- sidebar --
 st.sidebar.title("📉 Regression Detector")
-scenario = st.sidebar.selectbox(
-    "Scenario",
-    list(SCENARIO_LABELS),
-    format_func=lambda s: SCENARIO_LABELS[s],
+task = st.sidebar.selectbox(
+    "Task", list(TaskType), format_func=lambda t: t.value.capitalize()
 )
-model_type = st.sidebar.selectbox("Model type", MODEL_TYPES)
+scenarios = [
+    s for s in SCENARIO_LABELS
+    if task is TaskType.CLASSIFICATION or s not in CLASSIFICATION_ONLY
+]
+scenario = st.sidebar.selectbox(
+    "Scenario", scenarios, format_func=lambda s: SCENARIO_LABELS[s]
+)
+model_type = st.sidebar.selectbox("Model type", MODEL_TYPES[task])
 seed = st.sidebar.number_input("Random seed", min_value=0, max_value=99_999, value=42)
 
 st.sidebar.subheader("Decision thresholds")
@@ -98,7 +102,13 @@ page = st.sidebar.radio(
 
 with st.spinner("Training models and running detection (cached per configuration)..."):
     bundle, pair, a, config = run_pipeline(
-        scenario.value, model_type, int(seed), float(min_abs), float(min_rel), float(alpha)
+        task.value,
+        scenario.value,
+        model_type,
+        int(seed),
+        float(min_abs),
+        float(min_rel),
+        float(alpha),
     )
 
 
@@ -129,6 +139,24 @@ def metric_table(assessment: RegressionAssessment) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def segment_rows(assessment: RegressionAssessment) -> list[dict]:
+    rows = []
+    for r in assessment.segments.results:
+        if r.skipped:
+            continue
+        row = {
+            "segment": f"{r.column}={r.level}",
+            "n (base/cand)": f"{r.n_baseline}/{r.n_candidate}",
+        }
+        for k in r.baseline:
+            row[f"{k} base"] = round(r.baseline[k], 3)
+            row[f"{k} cand"] = round(r.candidate[k], 3)
+        row["adj. p"] = round(r.p_value_adjusted, 4)
+        row["degraded"] = r.degraded
+        rows.append(row)
+    return rows
+
+
 # ------------------------------------------------------------------ pages --
 if page == "Dashboard":
     st.title("Model health")
@@ -136,10 +164,7 @@ if page == "Dashboard":
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Baseline model", pair.baseline.version, pair.baseline.model_type)
     c2.metric("Candidate model", pair.candidate.version, pair.candidate.model_type)
-    c3.metric(
-        "Metrics degraded",
-        f"{len(a.affected_metrics)} / {len(a.metrics)}",
-    )
+    c3.metric("Metrics degraded", f"{len(a.affected_metrics)} / {len(a.metrics)}")
     c4.metric("Drifted features", a.drift.n_drifted_features)
     c5.metric("Affected segments", len(a.affected_segments))
 
@@ -151,12 +176,16 @@ if page == "Dashboard":
     fig.add_bar(name="candidate", x=names, y=[m.candidate_value for m in a.metrics])
     fig.update_layout(barmode="group", title="Baseline vs candidate metrics", height=420)
     st.plotly_chart(fig, use_container_width=True)
+    if bundle.task is TaskType.REGRESSION:
+        st.caption(
+            "Orientation differs by metric: MAE and RMSE degrade upward, "
+            "R-squared downward."
+        )
 
 elif page == "Model comparison":
     st.title("Metric comparison")
     status_badge(a)
-    df = metric_table(a)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(metric_table(a), use_container_width=True, hide_index=True)
 
     fig = go.Figure()
     for m in a.metrics:
@@ -186,7 +215,8 @@ elif page == "Model comparison":
     st.plotly_chart(fig, use_container_width=True)
     st.caption(
         "A metric is 'regressed' only when the change is practically large "
-        "(both thresholds) AND the CI excludes zero at the chosen alpha."
+        "(both thresholds) AND the CI excludes zero at the chosen alpha - "
+        "in the metric's own degrading direction."
     )
 
 elif page == "Drift analysis":
@@ -206,12 +236,15 @@ elif page == "Drift analysis":
     ]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    numeric = list(bundle.feature_columns)
-    chosen = st.selectbox("Inspect feature distribution", [*numeric, "prediction_score"])
+    pred_label = a.drift.prediction.feature
+    chosen = st.selectbox(
+        "Inspect distribution", [*bundle.feature_columns, pred_label]
+    )
     fig = go.Figure()
-    if chosen == "prediction_score":
-        base_vals = pair.baseline_scores["y_prob"]
-        cand_vals = pair.candidate_scores["y_prob"]
+    if chosen == pred_label:
+        col = Y_PROB if Y_PROB in pair.baseline_scores.columns else "y_pred"
+        base_vals = pair.baseline_scores[col]
+        cand_vals = pair.candidate_scores[col]
     else:
         base_vals = bundle.eval_baseline[chosen]
         cand_vals = bundle.eval_candidate[chosen]
@@ -228,27 +261,19 @@ elif page == "Segment analysis":
     st.title("Segment-level performance")
     status_badge(a)
     active = [r for r in a.segments.results if not r.skipped]
-    rows = [
-        {
-            "segment": f"{r.column}={r.level}",
-            "n (base/cand)": f"{r.n_baseline}/{r.n_candidate}",
-            "accuracy base": round(r.baseline["accuracy"], 3),
-            "accuracy cand": round(r.candidate["accuracy"], 3),
-            "recall base": round(r.baseline["recall"], 3),
-            "recall cand": round(r.candidate["recall"], 3),
-            "adj. p": round(r.p_value_adjusted, 4),
-            "degraded": r.degraded,
-        }
-        for r in active
-    ]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(segment_rows(a)), use_container_width=True, hide_index=True)
 
+    tested = active[0].tested_metric if active else "accuracy"
     fig = go.Figure()
     labels = [f"{r.column}={r.level}" for r in active]
-    fig.add_bar(name="baseline", x=labels, y=[r.baseline["accuracy"] for r in active])
-    fig.add_bar(name="candidate", x=labels, y=[r.candidate["accuracy"] for r in active])
+    fig.add_bar(name="baseline", x=labels, y=[r.baseline[tested] for r in active])
+    fig.add_bar(name="candidate", x=labels, y=[r.candidate[tested] for r in active])
     fig.update_layout(
-        barmode="group", title="Accuracy by segment", height=420, xaxis_tickangle=-30
+        barmode="group",
+        title=f"{tested} by segment"
+        + (" (lower is better)" if tested == "mae" else ""),
+        height=420,
+        xaxis_tickangle=-30,
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -268,7 +293,7 @@ elif page == "Explanation":
 
 else:  # Scenario notes
     st.title("Scenario mechanism (ground truth)")
-    st.write(f"**{SCENARIO_LABELS[scenario]}**")
+    st.write(f"**{SCENARIO_LABELS[scenario]}** — task: **{task.value}**")
     st.info(bundle.notes)
     st.write(
         "Every scenario is generated deterministically from the seed shown in the "

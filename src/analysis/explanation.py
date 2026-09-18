@@ -2,7 +2,9 @@
 
 No LLM, no templates library - plain structured prose generated from the
 evidence, answering: what happened, how bad, what supports it, what to
-investigate next. The same assessment always yields the same text.
+investigate next. The same assessment always yields the same text. Works
+for both task types; segment lines render the metrics that exist for the
+task (accuracy/recall for classification, MAE/bias for regression).
 """
 
 from __future__ import annotations
@@ -57,14 +59,22 @@ def _inconclusive_lines(a: RegressionAssessment) -> list[str]:
 def _segment_lines(a: RegressionAssessment) -> list[str]:
     lines: list[str] = []
     for r in a.segments.results:
-        if r.degraded:
-            lines.append(
-                f"- {r.column}={r.level}: accuracy {r.baseline['accuracy']:.3f} -> "
-                f"{r.candidate['accuracy']:.3f}, recall {r.baseline['recall']:.3f} -> "
-                f"{r.candidate['recall']:.3f} "
-                f"(adjusted p={r.p_value_adjusted:.4f}, "
-                f"n={r.n_baseline}/{r.n_candidate})."
+        if not r.degraded:
+            continue
+        if "accuracy" in r.baseline:      # classification segments
+            detail = (
+                f"accuracy {r.baseline['accuracy']:.3f} -> {r.candidate['accuracy']:.3f}, "
+                f"recall {r.baseline['recall']:.3f} -> {r.candidate['recall']:.3f}"
             )
+        else:                              # regression segments
+            detail = (
+                f"MAE {r.baseline['mae']:.3f} -> {r.candidate['mae']:.3f}, "
+                f"bias {r.baseline['bias']:+.3f} -> {r.candidate['bias']:+.3f}"
+            )
+        lines.append(
+            f"- {r.column}={r.level}: {detail} "
+            f"(adjusted p={r.p_value_adjusted:.4f}, n={r.n_baseline}/{r.n_candidate})."
+        )
     return lines
 
 
@@ -80,29 +90,36 @@ def _drift_lines(a: RegressionAssessment) -> list[str]:
     if a.drift.prediction_drift:
         p = a.drift.prediction
         lines.append(
-            f"- prediction scores: PSI={p.psi:.3f} ({p.psi_band}), ks p={p.p_value:.2e}. "
-            "A shifted score distribution warns of changed model behaviour but does not "
-            "by itself prove regression."
+            f"- {p.feature}: PSI={p.psi:.3f} ({p.psi_band}), ks p={p.p_value:.2e}. "
+            "A shifted prediction distribution warns of changed model behaviour but "
+            "does not by itself prove regression."
         )
     return lines
 
 
 def _recommendations(a: RegressionAssessment) -> list[str]:
+    affected = set(a.affected_metrics)
     recs: list[str] = []
-    if a.affected_metrics:
+    if affected:
         recs.append(
-            "Compare candidate and baseline training data: label distributions, "
-            "class balance, and any relabelling or pipeline changes."
+            "Compare candidate and baseline training data: target distributions, "
+            "labelling or measurement changes, and any pipeline differences."
         )
-    if "recall" in a.affected_metrics or "precision" in a.affected_metrics:
+    if affected & {"recall", "precision"}:
         recs.append(
             "Inspect the decision threshold: a boundary shift (precision up, recall "
             "down, ranking metrics stable) points to calibration, not lost signal."
         )
+    if affected & {"mae", "rmse", "r2"}:
+        recs.append(
+            "Check candidate residuals for systematic bias (mean error != 0) versus "
+            "widened variance - bias points to target-scale or leakage changes, "
+            "variance to lost signal or underfitting."
+        )
     if a.affected_segments:
         recs.append(
             f"Audit training data for the degraded segment(s) "
-            f"{', '.join(a.affected_segments)}: coverage, label quality, and any "
+            f"{', '.join(a.affected_segments)}: coverage, target quality, and any "
             "segment-correlated pipeline change."
         )
     drifted = [f.feature for f in a.drift.features if f.drifted]

@@ -3,7 +3,7 @@
 Techniques (each with explicit assumptions):
 
 * Kolmogorov-Smirnov two-sample test - numeric features and prediction
-  scores. Nonparametric; sensitive to any distributional difference; at
+  outputs. Nonparametric; sensitive to any distributional difference; at
   large n it flags trivially small shifts, which is why the PSI magnitude
   accompanies every p-value.
 * Chi-square test of homogeneity - categorical features. Requires expected
@@ -15,6 +15,11 @@ Techniques (each with explicit assumptions):
 
 A feature is flagged as DRIFTED only if the test is significant AND
 PSI >= psi_warning: statistical detectability plus material magnitude.
+
+Prediction drift: for classification frames the compared output is the
+predicted probability (``y_prob``); for regression frames it is the
+predicted value (``y_pred``). Both are continuous, so the same KS + PSI
+machinery applies unchanged.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from src.models.model_factory import Y_PROB
+from src.models.model_factory import Y_PRED, Y_PROB
 from src.utils.config import DetectionConfig
 
 _EPS = 1e-6
@@ -172,10 +177,11 @@ def detect_drift(
             _categorical_drift(col, eval_baseline[col], eval_candidate[col], config)
         )
 
+    pred_col = Y_PROB if Y_PROB in baseline_scores.columns else Y_PRED
     pred = _numeric_drift(
-        "prediction_score",
-        baseline_scores[Y_PROB].to_numpy(dtype=float),
-        candidate_scores[Y_PROB].to_numpy(dtype=float),
+        "prediction_score" if pred_col == Y_PROB else "prediction_value",
+        baseline_scores[pred_col].to_numpy(dtype=float),
+        candidate_scores[pred_col].to_numpy(dtype=float),
         config,
     )
     pred = FeatureDriftResult(**{**pred.__dict__, "kind": "prediction"})
