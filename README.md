@@ -5,6 +5,7 @@
 ![CI](https://github.com/bdeva1975/model-regression-detector/actions/workflows/ci.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
+![Dashboard — recall regression detected](docs/images/dashboard.png)
 
 ## The problem
 
