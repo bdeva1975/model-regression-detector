@@ -1,18 +1,25 @@
 """Deterministic synthetic-scenario generator.
 
 Produces train/eval datasets for a *baseline* and a *candidate* model under
-controlled scenarios (healthy, various regressions, drift, false alarms).
+controlled scenarios (healthy, various regressions, drift, false alarms),
+for two task types: binary classification and (continuous-target)
+regression.
 
 Design principles:
 
-* Regressions are induced by corrupting the CANDIDATE'S TRAINING LABELS, so
-  the candidate model genuinely learns worse behaviour. Predictions are never
-  tampered with after the fact.
-* Drift scenarios shift EVALUATION FEATURES while regenerating labels from
+* Regressions are induced by corrupting the CANDIDATE'S TRAINING TARGETS,
+  so the candidate model genuinely learns worse behaviour. Predictions are
+  never tampered with after the fact.
+* Corruptions must be LEARNABLE: zero-mean symmetric noise teaches a model
+  nothing (it averages out at training scale). Classification scenarios use
+  directional label flips; regression-task scenarios use multiplicative
+  attenuation or additive bias - distortions the model absorbs into its
+  weights and then reproduces, wrongly, on clean evaluation data.
+* Drift scenarios shift EVALUATION FEATURES while regenerating targets from
   the same ground-truth function, so drift occurs WITHOUT performance loss:
   - feature_drift shifts non-informative features (data drift, no effect),
-  - prediction_drift shifts the most informative feature (score distribution
-    moves, quality holds).
+  - prediction_drift shifts the most informative feature (prediction
+    distribution moves, quality holds).
 * Everything is driven by one ``numpy.random.Generator`` seeded from the
   config: the same config always regenerates identical data.
 """
@@ -39,6 +46,13 @@ SEGMENT_PROBS: dict[str, tuple[float, ...]] = {
 }
 
 
+class TaskType(StrEnum):
+    """Supported supervised-learning task types."""
+
+    CLASSIFICATION = "classification"
+    REGRESSION = "regression"
+
+
 class Scenario(StrEnum):
     """Named, reproducible production situations."""
 
@@ -53,18 +67,33 @@ class Scenario(StrEnum):
     STAT_SIG_SMALL = "statistically_significant_but_practically_small"
 
 
+#: Scenarios whose mechanism (threshold-side label flips) only exists for
+#: binary classification. For the regression task, ACCURACY_REGRESSION
+#: plays the role of the general "error regression" scenario.
+CLASSIFICATION_ONLY: frozenset[Scenario] = frozenset(
+    {Scenario.PRECISION_REGRESSION, Scenario.RECALL_REGRESSION}
+)
+
+
 @dataclass(frozen=True)
 class GeneratorConfig:
-    """Controls one synthetic scenario. Same config -> identical data."""
+    """Controls one synthetic scenario. Same config -> identical data.
+
+    ``label_noise`` is the irreducible-noise knob for both tasks:
+    classification attenuates the logits by ``(1 - label_noise)``;
+    regression adds Gaussian target noise with standard deviation
+    ``label_noise * ||weights||`` (i.e. relative to the signal scale).
+    """
 
     scenario: Scenario = Scenario.HEALTHY
+    task: TaskType = TaskType.CLASSIFICATION
     n_train: int = 4000
     n_eval: int = 2000
     n_features: int = 8
     n_informative: int = 5
-    class_balance: float = 0.35     # target positive rate
-    label_noise: float = 0.15       # 0 = clean labels, 1 = pure noise
-    regression_magnitude: float = 0.25   # fraction of candidate train labels corrupted
+    class_balance: float = 0.35     # target positive rate (classification)
+    label_noise: float = 0.15       # see class docstring
+    regression_magnitude: float = 0.25   # scenario corruption strength
     drift_magnitude: float = 1.25   # mean shift, in feature std devs
     affected_segment: tuple[str, str] = ("risk_band", "high")
     seed: int = 42
@@ -85,6 +114,11 @@ class GeneratorConfig:
             raise ValueError(f"affected_segment {self.affected_segment} is not a known segment")
         if min(self.n_train, self.n_eval) < 200:
             raise ValueError("n_train and n_eval must each be >= 200")
+        if self.task is TaskType.REGRESSION and self.scenario in CLASSIFICATION_ONLY:
+            raise ValueError(
+                f"scenario {self.scenario.value!r} has no regression-task analogue; "
+                "use accuracy_regression as the general error-regression scenario"
+            )
 
 
 @dataclass(frozen=True)
@@ -92,6 +126,7 @@ class ScenarioBundle:
     """Everything downstream stages need for one scenario."""
 
     scenario: Scenario
+    task: TaskType
     config: GeneratorConfig
     baseline_train: pd.DataFrame
     candidate_train: pd.DataFrame
@@ -113,6 +148,11 @@ def _make_weights(cfg: GeneratorConfig, rng: np.random.Generator) -> np.ndarray:
     # Guarantee a clearly dominant feature so prediction_drift has a lever.
     w[0] = np.sign(w[0] or 1.0) * max(abs(w[0]), 1.5)
     return w
+
+
+def _signal_scale(weights: np.ndarray) -> float:
+    """Std of the noise-free signal X @ w for X ~ N(0, I)."""
+    return float(np.linalg.norm(weights)) or 1.0
 
 
 def _sigmoid(z: np.ndarray) -> np.ndarray:
@@ -144,6 +184,30 @@ def _true_labels(
     return (rng.random(len(features)) < _sigmoid(logits)).astype(np.int64)
 
 
+def _true_targets(
+    cfg: GeneratorConfig,
+    rng: np.random.Generator,
+    features: pd.DataFrame,
+    weights: np.ndarray,
+    intercept: float,
+) -> np.ndarray:
+    signal = features.to_numpy() @ weights + intercept
+    noise_sd = cfg.label_noise * _signal_scale(weights)
+    return signal + rng.normal(0.0, noise_sd, size=len(features))
+
+
+def _truth(
+    cfg: GeneratorConfig,
+    rng: np.random.Generator,
+    features: pd.DataFrame,
+    weights: np.ndarray,
+    intercept: float,
+) -> np.ndarray:
+    if cfg.task is TaskType.CLASSIFICATION:
+        return _true_labels(cfg, rng, features, weights, intercept)
+    return _true_targets(cfg, rng, features, weights, intercept)
+
+
 def _make_split(
     cfg: GeneratorConfig,
     rng: np.random.Generator,
@@ -153,7 +217,7 @@ def _make_split(
 ) -> pd.DataFrame:
     features = _sample_features(cfg, rng, n)
     segments = _sample_segments(rng, n)
-    y = _true_labels(cfg, rng, features, weights, intercept)
+    y = _truth(cfg, rng, features, weights, intercept)
     out = pd.concat([features, segments], axis=1)
     out[TARGET] = y
     return out
@@ -193,6 +257,37 @@ def _flip_labels(
     return out
 
 
+def _distort_targets(
+    df: pd.DataFrame,
+    rng: np.random.Generator,
+    *,
+    scale: float = 1.0,
+    bias: float = 0.0,
+    noise_sd: float = 0.0,
+    fraction: float = 1.0,
+    mask: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Return a copy with a fraction of eligible continuous targets distorted.
+
+    Applies, to each chosen row: ``y' = scale * y + bias + N(0, noise_sd)``.
+    Multiplicative scale and additive bias are LEARNABLE distortions; pure
+    zero-mean noise (scale=1, bias=0) is mostly harmless by design and is
+    used only for the false-alarm scenario.
+    """
+    out = df.copy()
+    y = out[TARGET].to_numpy(dtype=float).copy()
+    eligible = np.ones(len(out), dtype=bool) if mask is None else mask.copy()
+    idx = np.flatnonzero(eligible)
+    n_pick = int(round(fraction * len(idx)))
+    if n_pick > 0:
+        chosen = rng.choice(idx, size=n_pick, replace=False)
+        y[chosen] = scale * y[chosen] + bias
+        if noise_sd > 0:
+            y[chosen] += rng.normal(0.0, noise_sd, size=n_pick)
+    out[TARGET] = y
+    return out
+
+
 def _shift_features(
     df: pd.DataFrame,
     cfg: GeneratorConfig,
@@ -212,8 +307,196 @@ def _shift_features(
         out[col] = out[col] + cfg.drift_magnitude
     if relabel:
         feature_cols = [f"f{i}" for i in range(cfg.n_features)]
-        out[TARGET] = _true_labels(cfg, rng, out[feature_cols], weights, intercept)
+        out[TARGET] = _truth(cfg, rng, out[feature_cols], weights, intercept)
     return out
+
+
+# --------------------------------------------------------------------------
+# Scenario application, per task
+# --------------------------------------------------------------------------
+
+def _apply_classification_scenario(
+    s: Scenario,
+    eff: GeneratorConfig,
+    rng: np.random.Generator,
+    candidate_train: pd.DataFrame,
+    eval_candidate: pd.DataFrame,
+    weights: np.ndarray,
+    intercept: float,
+    informative: list[str],
+    non_informative: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    if s is Scenario.HEALTHY:
+        return (
+            candidate_train,
+            eval_candidate,
+            "Candidate trained on clean data from the same distribution. Expect: no regression.",
+        )
+    if s is Scenario.ACCURACY_REGRESSION:
+        candidate_train = _flip_labels(candidate_train, rng, eff.regression_magnitude, "both")
+        return (
+            candidate_train,
+            eval_candidate,
+            f"{eff.regression_magnitude:.0%} of candidate training labels flipped in both "
+            "directions. Expect: broad metric regression (accuracy, F1, AUC, log loss).",
+        )
+    if s is Scenario.RECALL_REGRESSION:
+        frac = min(1.8 * eff.regression_magnitude, 0.49)
+        candidate_train = _flip_labels(candidate_train, rng, frac, "pos_to_neg")
+        return (
+            candidate_train,
+            eval_candidate,
+            f"{frac:.0%} of candidate training POSITIVES relabelled negative. "
+            "Expect: recall drops sharply; precision holds or rises; accuracy may look fine.",
+        )
+    if s is Scenario.PRECISION_REGRESSION:
+        frac = min(1.2 * eff.regression_magnitude, 0.49)
+        candidate_train = _flip_labels(candidate_train, rng, frac, "neg_to_pos")
+        return (
+            candidate_train,
+            eval_candidate,
+            f"{frac:.0%} of candidate training NEGATIVES relabelled positive. "
+            "Expect: precision drops; recall holds or rises.",
+        )
+    if s is Scenario.SEGMENT_REGRESSION:
+        col, level = eff.affected_segment
+        mask = (candidate_train[col] == level).to_numpy()
+        frac = min(3.0 * eff.regression_magnitude, 0.85)
+        candidate_train = _flip_labels(candidate_train, rng, frac, "pos_to_neg", mask=mask)
+        return (
+            candidate_train,
+            eval_candidate,
+            f"{frac:.0%} of candidate training POSITIVES relabelled negative ONLY where "
+            f"{col} == '{level}'. Expect: overall metrics near-healthy; that segment's "
+            "recall and accuracy degrade materially.",
+        )
+    if s is Scenario.FEATURE_DRIFT:
+        eval_candidate = _shift_features(
+            eval_candidate, eff, rng, non_informative[:2], weights, intercept, relabel=True
+        )
+        return (
+            candidate_train,
+            eval_candidate,
+            f"Non-informative features {non_informative[:2]} mean-shifted by "
+            f"{eff.drift_magnitude} std in the candidate window; labels regenerated from "
+            "ground truth. Expect: feature drift flagged, NO performance regression.",
+        )
+    if s is Scenario.PREDICTION_DRIFT:
+        eval_candidate = _shift_features(
+            eval_candidate, eff, rng, [informative[0]], weights, intercept, relabel=True
+        )
+        return (
+            candidate_train,
+            eval_candidate,
+            f"Most informative feature {informative[0]} mean-shifted by "
+            f"{eff.drift_magnitude} std with labels regenerated. Expect: prediction "
+            "distribution shifts, quality roughly holds - a warning, not a regression.",
+        )
+    if s is Scenario.FALSE_ALARM:
+        candidate_train = _flip_labels(candidate_train, rng, 0.02, "both")
+        return (
+            candidate_train,
+            eval_candidate,
+            "2% label noise in candidate training. Expect: tiny metric wobble below both "
+            "practical and statistical thresholds - NO material regression.",
+        )
+    if s is Scenario.STAT_SIG_SMALL:
+        candidate_train = _flip_labels(candidate_train, rng, 0.04, "pos_to_neg")
+        return (
+            candidate_train,
+            eval_candidate,
+            "4% of candidate training positives relabelled negative, evaluated on "
+            "~20k-sample windows. Expect: a small, real recall dip - statistically "
+            "significant at this sample size, but below the practical threshold. "
+            "The system must report it as negligible, not as a regression.",
+        )
+    raise ValueError(f"unhandled scenario: {s}")  # pragma: no cover
+
+
+def _apply_regression_scenario(
+    s: Scenario,
+    eff: GeneratorConfig,
+    rng: np.random.Generator,
+    candidate_train: pd.DataFrame,
+    eval_candidate: pd.DataFrame,
+    weights: np.ndarray,
+    intercept: float,
+    informative: list[str],
+    non_informative: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    scale = _signal_scale(weights)
+    if s is Scenario.HEALTHY:
+        return (
+            candidate_train,
+            eval_candidate,
+            "Candidate trained on clean data from the same distribution. Expect: no regression.",
+        )
+    if s is Scenario.ACCURACY_REGRESSION:
+        atten = 1.0 - eff.regression_magnitude
+        candidate_train = _distort_targets(candidate_train, rng, scale=atten)
+        return (
+            candidate_train,
+            eval_candidate,
+            f"Candidate training targets multiplied by {atten:.2f} (systematic "
+            "attenuation the model learns as shrunk weights). Expect: MAE and RMSE "
+            "rise, R-squared falls on clean evaluation data.",
+        )
+    if s is Scenario.SEGMENT_REGRESSION:
+        col, level = eff.affected_segment
+        mask = (candidate_train[col] == level).to_numpy()
+        bias = 0.45 * eff.regression_magnitude * scale
+        candidate_train = _distort_targets(candidate_train, rng, bias=bias, mask=mask)
+        return (
+            candidate_train,
+            eval_candidate,
+            f"Constant bias of {bias:.2f} added to candidate training targets ONLY where "
+            f"{col} == '{level}' (the model learns a shifted segment intercept). Expect: "
+            "overall error metrics near-healthy; that segment's error rises materially.",
+        )
+    if s is Scenario.FEATURE_DRIFT:
+        eval_candidate = _shift_features(
+            eval_candidate, eff, rng, non_informative[:2], weights, intercept, relabel=True
+        )
+        return (
+            candidate_train,
+            eval_candidate,
+            f"Non-informative features {non_informative[:2]} mean-shifted by "
+            f"{eff.drift_magnitude} std in the candidate window; targets regenerated from "
+            "ground truth. Expect: feature drift flagged, NO performance regression.",
+        )
+    if s is Scenario.PREDICTION_DRIFT:
+        eval_candidate = _shift_features(
+            eval_candidate, eff, rng, [informative[0]], weights, intercept, relabel=True
+        )
+        return (
+            candidate_train,
+            eval_candidate,
+            f"Most informative feature {informative[0]} mean-shifted by "
+            f"{eff.drift_magnitude} std with targets regenerated. Expect: prediction "
+            "distribution shifts, quality roughly holds - a warning, not a regression.",
+        )
+    if s is Scenario.FALSE_ALARM:
+        candidate_train = _distort_targets(
+            candidate_train, rng, noise_sd=0.2 * eff.label_noise * scale, fraction=0.05
+        )
+        return (
+            candidate_train,
+            eval_candidate,
+            "Tiny zero-mean target noise on 5% of candidate training rows (mostly "
+            "harmless by construction). Expect: NO material regression.",
+        )
+    if s is Scenario.STAT_SIG_SMALL:
+        bias = 0.03 * scale
+        candidate_train = _distort_targets(candidate_train, rng, bias=bias)
+        return (
+            candidate_train,
+            eval_candidate,
+            f"Constant bias of {bias:.3f} added to ALL candidate training targets, "
+            "evaluated on ~20k-sample windows. Expect: a small, real error increase - "
+            "statistically significant at this sample size, but below the practical "
+            "threshold. The system must report it as negligible.",
+        )
+    raise ValueError(f"unhandled scenario for regression task: {s}")  # pragma: no cover
 
 
 # --------------------------------------------------------------------------
@@ -241,76 +524,26 @@ def generate(cfg: GeneratorConfig) -> ScenarioBundle:
     informative = feature_cols[: eff.n_informative]
     non_informative = feature_cols[eff.n_informative :] or feature_cols[-2:]
 
-    s = eff.scenario
-    if s is Scenario.HEALTHY:
-        notes = "Candidate trained on clean data from the same distribution. Expect: no regression."
-    elif s is Scenario.ACCURACY_REGRESSION:
-        candidate_train = _flip_labels(candidate_train, rng, eff.regression_magnitude, "both")
-        notes = (
-            f"{eff.regression_magnitude:.0%} of candidate training labels flipped in both "
-            "directions. Expect: broad metric regression (accuracy, F1, AUC, log loss)."
-        )
-    elif s is Scenario.RECALL_REGRESSION:
-        frac = min(1.8 * eff.regression_magnitude, 0.49)
-        candidate_train = _flip_labels(candidate_train, rng, frac, "pos_to_neg")
-        notes = (
-            f"{frac:.0%} of candidate training POSITIVES relabelled negative. "
-            "Expect: recall drops sharply; precision holds or rises; accuracy may look fine."
-        )
-    elif s is Scenario.PRECISION_REGRESSION:
-        frac = min(1.2 * eff.regression_magnitude, 0.49)
-        candidate_train = _flip_labels(candidate_train, rng, frac, "neg_to_pos")
-        notes = (
-            f"{frac:.0%} of candidate training NEGATIVES relabelled positive. "
-            "Expect: precision drops; recall holds or rises."
-        )
-    elif s is Scenario.SEGMENT_REGRESSION:
-        col, level = eff.affected_segment
-        mask = (candidate_train[col] == level).to_numpy()
-        frac = min(3.0 * eff.regression_magnitude, 0.85)
-        candidate_train = _flip_labels(candidate_train, rng, frac, "pos_to_neg", mask=mask)
-        notes = (
-            f"{frac:.0%} of candidate training POSITIVES relabelled negative ONLY where "
-            f"{col} == '{level}'. Expect: overall metrics near-healthy; that segment's "
-            "recall and accuracy degrade materially."
-        )
-    elif s is Scenario.FEATURE_DRIFT:
-        eval_candidate = _shift_features(
-            eval_candidate, eff, rng, non_informative[:2], weights, intercept, relabel=True
-        )
-        notes = (
-            f"Non-informative features {non_informative[:2]} mean-shifted by "
-            f"{eff.drift_magnitude} std in the candidate window; labels regenerated from "
-            "ground truth. Expect: feature drift flagged, NO performance regression."
-        )
-    elif s is Scenario.PREDICTION_DRIFT:
-        eval_candidate = _shift_features(
-            eval_candidate, eff, rng, [informative[0]], weights, intercept, relabel=True
-        )
-        notes = (
-            f"Most informative feature {informative[0]} mean-shifted by "
-            f"{eff.drift_magnitude} std with labels regenerated. Expect: prediction "
-            "distribution shifts, quality roughly holds - a warning, not a regression."
-        )
-    elif s is Scenario.FALSE_ALARM:
-        candidate_train = _flip_labels(candidate_train, rng, 0.02, "both")
-        notes = (
-            "2% label noise in candidate training. Expect: tiny metric wobble below both "
-            "practical and statistical thresholds - NO material regression."
-        )
-    elif s is Scenario.STAT_SIG_SMALL:
-        candidate_train = _flip_labels(candidate_train, rng, 0.04, "pos_to_neg")
-        notes = (
-            "4% of candidate training positives relabelled negative, evaluated on "
-            "~20k-sample windows. Expect: a small, real recall dip - statistically "
-            "significant at this sample size, but below the practical threshold. "
-            "The system must report it as negligible, not as a regression."
-        )
-    else:  # pragma: no cover - enum is exhaustive
-        raise ValueError(f"unhandled scenario: {s}")
+    apply_scenario = (
+        _apply_classification_scenario
+        if eff.task is TaskType.CLASSIFICATION
+        else _apply_regression_scenario
+    )
+    candidate_train, eval_candidate, notes = apply_scenario(
+        eff.scenario,
+        eff,
+        rng,
+        candidate_train,
+        eval_candidate,
+        weights,
+        intercept,
+        informative,
+        non_informative,
+    )
 
     return ScenarioBundle(
-        scenario=s,
+        scenario=eff.scenario,
+        task=eff.task,
         config=eff,
         baseline_train=baseline_train,
         candidate_train=candidate_train,

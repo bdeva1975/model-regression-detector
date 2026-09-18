@@ -20,6 +20,7 @@ This project is a small, self-contained reference implementation of a **model qu
 - **Segment-level detection.** Per-segment baseline/candidate comparison with Bonferroni-adjusted bootstrap p-values, catching the "overall fine, high-risk segment broken" failure that aggregate metrics hide.
 - **Deterministic explanations.** Every verdict comes with prose: what changed, by how much, against what baseline, with what evidence, and what to investigate next. No LLM involved — the explanation engine is pure logic over the evidence, and the same inputs always produce the same text.
 - **A scenario lab.** Nine synthetic production scenarios (healthy, accuracy/precision/recall regression, segment regression, feature drift, prediction drift, false alarm, significant-but-negligible), each generated deterministically from a seed, each engineered so the *models genuinely learn* the failure — training labels are corrupted; predictions are never tampered with.
+- **Two task types.** Binary classification (7 metrics) and continuous regression (MAE, RMSE, R² — MAPE deliberately excluded for zero-crossing targets), sharing one detection engine, one drift module, and one task-aware segment analyzer.
 
 ## Quick start
 
@@ -135,15 +136,14 @@ model-regression-detector/
 - **Independent-windows assumption.** The two-sample bootstrap assumes i.i.d. observations within each window; production windows with temporal correlation violate this and widen true intervals.
 - **Percentile bootstrap CIs** can be slightly off for skewed statistics at small n; a minimum sample size is enforced, not a cure.
 - **Bonferroni is conservative.** Segment testing controls false alarms at the cost of power on many small segments.
-- **Binary classification first.** Regression-task metrics (MAE/RMSE/R²) are architecturally planned but not yet implemented.
 - This is a reference implementation for learning and evaluation gates — not a replacement for a production ML observability platform.
 
 ## Roadmap
 
 | Version | Scope |
 |---|---|
-| v0.1 | Synthetic scenarios, detection core, dashboard, tests, CI *(this release)* |
-| v0.2 | Regression-task models and metrics; richer statistical tests |
+| v0.1 | Synthetic scenarios, detection core, dashboard, tests, CI |
+| v0.2 | Regression-task models and metrics; task-aware segments and explanations *(this release)* |
 | v0.3 | Bring-your-own scored predictions (CSV/parquet ingestion) |
 | v0.4 | CLI + CI/CD quality-gate mode (exit codes for pipelines) |
 | v0.5 | Optional LLM-written explanations (user-supplied API key, opt-in) |

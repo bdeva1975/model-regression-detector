@@ -34,7 +34,10 @@ from sklearn.metrics import (
     average_precision_score,
     f1_score,
     log_loss,
+    mean_absolute_error,
+    mean_squared_error,
     precision_score,
+    r2_score,
     recall_score,
     roc_auc_score,
 )
@@ -52,6 +55,14 @@ def _metric_value(name: str, y_true: np.ndarray, y_prob: np.ndarray, y_pred: np.
         return float(recall_score(y_true, y_pred, zero_division=0))
     if name == "f1":
         return float(f1_score(y_true, y_pred, zero_division=0))
+    if name == "mae":
+        return float(mean_absolute_error(y_true, y_pred))
+    if name == "rmse":
+        return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    if name == "r2":
+        if np.var(y_true) == 0.0:
+            return float("nan")
+        return float(r2_score(y_true, y_pred))
     single_class = np.unique(y_true).size < 2
     if single_class:
         return float("nan")
@@ -96,10 +107,18 @@ def bootstrap_metric_diff(
         )
 
     bt = baseline_scores[Y_TRUE].to_numpy()
-    bp = baseline_scores[Y_PROB].to_numpy()
+    bp = (
+        baseline_scores[Y_PROB].to_numpy()
+        if Y_PROB in baseline_scores.columns
+        else np.zeros(nb)
+    )
     bd = baseline_scores[Y_PRED].to_numpy()
     ct = candidate_scores[Y_TRUE].to_numpy()
-    cp = candidate_scores[Y_PROB].to_numpy()
+    cp = (
+        candidate_scores[Y_PROB].to_numpy()
+        if Y_PROB in candidate_scores.columns
+        else np.zeros(nc)
+    )
     cd = candidate_scores[Y_PRED].to_numpy()
 
     base_val = _metric_value(metric, bt, bp, bd)
