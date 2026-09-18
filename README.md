@@ -3,7 +3,7 @@
 **Detect and explain when a new ML model is materially worse than the one it replaces — with statistical evidence, not vibes.**
 
 ![CI](https://github.com/bdeva1975/model-regression-detector/actions/workflows/ci.yml/badge.svg)
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## The problem
@@ -125,7 +125,7 @@ model-regression-detector/
 │   │   └── explanation.py          # deterministic prose
 │   └── utils/config.py             # all thresholds, validated
 ├── tests/                          # 30 behavioural tests
-└── .github/workflows/ci.yml        # lint + tests, py3.11/3.13
+└── .github/workflows/ci.yml        # lint + tests, py3.12/3.13
 ```
 
 ## Honest limitations

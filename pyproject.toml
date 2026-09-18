@@ -5,7 +5,7 @@ description = "Detect and explain ML model regression: metric degradation, drift
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Devasish Banerjee" }]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "streamlit>=1.40",
     "scikit-learn>=1.5",
@@ -23,7 +23,7 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]
