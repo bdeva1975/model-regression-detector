@@ -1,0 +1,32 @@
+[project]
+name = "model-regression-detector"
+version = "0.1.0"
+description = "Detect and explain ML model regression: metric degradation, drift, segment analysis, and statistical validation - with synthetic scenarios and a Streamlit dashboard."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Devasish Banerjee" }]
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.40",
+    "scikit-learn>=1.5",
+    "pandas>=2.2",
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "plotly>=5.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
